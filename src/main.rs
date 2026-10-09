@@ -1,22 +1,39 @@
-//! stdio entry point for the `name-match-mcp` server.
+//! Entry point of the `name-match` CLI.
+//!
+//! Exit codes: `0` on success, `1` on any failure. JSON always goes to stdout;
+//! diagnostics go to stderr.
 
-use rmcp::{ServiceExt, transport::stdio};
+use std::process::ExitCode;
 
-use name_match_mcp::server::NameMatchServer;
+use name_match::cli::{self, Command};
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> std::process::ExitCode {
-    match run().await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("name-match-mcp failed: {error}");
-            std::process::ExitCode::FAILURE
+fn main() -> ExitCode {
+    match cli::parse(std::env::args().skip(1)) {
+        Ok(Command::Help) => {
+            print!("{}", cli::HELP);
+            ExitCode::SUCCESS
         }
+        Ok(Command::Version) => {
+            println!("name-match {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Ok(Command::Match(args)) => match cli::run(&args) {
+            Ok(summary) => match cli::render_summary(&summary) {
+                Ok(json) => {
+                    println!("{json}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(&error),
+            },
+            Err(error) => fail(&error),
+        },
+        Err(error) => fail(&error),
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let service = NameMatchServer::new().serve(stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+/// Print the JSON error document on stdout and the reason on stderr.
+fn fail(error: &cli::CliError) -> ExitCode {
+    println!("{}", cli::render_error(error));
+    eprintln!("name-match: {}", error.message);
+    ExitCode::FAILURE
 }

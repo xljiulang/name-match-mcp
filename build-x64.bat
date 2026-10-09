@@ -3,12 +3,12 @@ chcp 65001 >nul
 setlocal
 
 rem ---------------------------------------------------------------------------
-rem Build name-match-mcp for Windows x64 and copy the exe into dist\.
+rem Build name-match for Windows x64 and copy the exe into dist\.
 rem Run it from anywhere: it always builds the directory the script lives in.
 rem ---------------------------------------------------------------------------
 
 set "TARGET=x86_64-pc-windows-msvc"
-set "BINARY=name-match-mcp.exe"
+set "BINARY=name-match.exe"
 
 cd /d "%~dp0"
 if errorlevel 1 (
@@ -69,7 +69,7 @@ echo.
 echo Build succeeded.
 echo   Artifact: %CD%\dist\%BINARY%
 for %%F in ("dist\%BINARY%") do echo   Size:     %%~zF bytes
-echo   Register this exe as a stdio MCP server in your client config.
+echo   Put this exe on PATH, or call it with its full path from the skill.
 
 endlocal
 exit /b 0

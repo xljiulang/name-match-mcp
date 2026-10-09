@@ -1,8 +1,8 @@
-//! Core name-matching logic for the `name-match-mcp` server.
+//! Core name-matching logic for the `name-match` CLI.
 //!
-//! The module is intentionally free of any MCP concerns so it can be unit tested
-//! as plain functions: normalization, similarity metrics, candidate recall, and
-//! helpers for the workbook surgery in [`xlsx`].
+//! The crate is intentionally free of any I/O concerns beyond plain file access
+//! so everything can be unit tested as plain functions: normalization,
+//! similarity metrics, candidate recall, and the workbook surgery in [`xlsx`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+pub mod cli;
 pub mod replacement;
-pub mod server;
 pub mod test_support;
 pub mod xlsx;
 
@@ -27,7 +27,7 @@ pub const BIGRAM_WEIGHT: f64 = 0.3;
 /// One entry of the output set `C`.
 ///
 /// Exactly one entry is produced per input target name, in the same order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchItem {
     /// The original target name, echoed back unchanged.
     pub name: String,

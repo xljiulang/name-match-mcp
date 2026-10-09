@@ -1,0 +1,4 @@
+interface:
+  display_name: "名称匹配"
+  short_description: "按列匹配 xlsx 名称并回写结果"
+  default_prompt: "用 $name-match 把统计.xlsx 里 9月压面的商品名称匹配到 9月贴面的组装商品1。"
