@@ -267,6 +267,12 @@ impl Workbook {
     /// worksheet, so an existing neighbour column is never overwritten. If the
     /// header row already has columns with the requested names, those are
     /// reused and overwritten instead.
+    ///
+    /// The two result columns are rebuilt rather than appended to: every
+    /// existing cell of those columns is removed from the affected rows before
+    /// the new value is written. Running the tool repeatedly on the same
+    /// workbook therefore stays idempotent — no duplicate `<c>` elements — and
+    /// the columns always describe the most recent run only.
     pub fn write_result_columns(
         &mut self,
         sheet: &str,
@@ -323,26 +329,27 @@ impl Workbook {
         }
 
         let mut out = String::with_capacity(xml.len() + rows.len() * 160);
-        out.push_str(&xml[..0]);
         let mut cursor = 0usize;
         for (row_number, row_start, row_end) in iterate_rows(&xml) {
             // Everything before this row, plus its opening tag.
             let (row_open_start, row_open_end) = row_open_bounds(&xml, row_start);
             out.push_str(&xml[cursor..row_open_start]);
             let open_tag = &xml[row_open_start..row_open_end];
-            let inner = &xml[row_open_end..row_end];
-            let closing = &xml[row_end..row_end + "</row>".len()];
-            debug_assert_eq!(closing, "</row>");
-
             let is_self_closing = open_tag.trim_end().ends_with("/>");
-            let mut new_open = open_tag.to_string();
-            if !is_self_closing {
-                new_open = set_span(new_open, last_column);
-            }
+            let inner = if is_self_closing {
+                ""
+            } else {
+                debug_assert!(xml[row_end..].starts_with("</row>"));
+                &xml[row_open_end..row_end]
+            };
 
-            let extra = if row_number == header_row {
+            // Which existing cells of this row must be dropped, and what to
+            // write in their place.
+            let (drop_columns, extra) = if row_number == header_row {
+                let mut drop = Vec::new();
                 let mut cells = String::new();
                 if existing_match.is_none() {
+                    drop.push(match_column);
                     cells.push_str(&inline_cell(
                         match_column,
                         row_number,
@@ -351,6 +358,7 @@ impl Workbook {
                     ));
                 }
                 if existing_score.is_none() {
+                    drop.push(score_column);
                     cells.push_str(&inline_cell(
                         score_column,
                         row_number,
@@ -358,46 +366,71 @@ impl Workbook {
                         score_header,
                     ));
                 }
-                cells
-            } else if let Some(write) = writes.get(&row_number) {
-                let style = style_of(&parse_cells(inner), target_column)
-                    .or_else(|| header_style.clone());
-                let mut cells = String::new();
-                match &write.matched {
-                    Some(name) => cells.push_str(&inline_cell(
-                        match_column,
-                        row_number,
-                        style.as_deref(),
-                        name,
-                    )),
-                    None => cells.push_str(&empty_cell(
-                        match_column,
-                        row_number,
-                        style.as_deref(),
-                    )),
-                }
-                cells.push_str(&number_cell(
-                    score_column,
-                    row_number,
-                    style.as_deref(),
-                    write.score,
-                ));
-                cells
+                (drop, cells)
+            } else if row_number > header_row {
+                let drop = vec![match_column, score_column];
+                let cells = match writes.get(&row_number) {
+                    Some(write) => {
+                        let style = style_of(&parse_cells(inner), target_column)
+                            .or_else(|| header_style.clone());
+                        let mut cells = String::new();
+                        match &write.matched {
+                            Some(name) => cells.push_str(&inline_cell(
+                                match_column,
+                                row_number,
+                                style.as_deref(),
+                                name,
+                            )),
+                            None => cells.push_str(&empty_cell(
+                                match_column,
+                                row_number,
+                                style.as_deref(),
+                            )),
+                        }
+                        cells.push_str(&number_cell(
+                            score_column,
+                            row_number,
+                            style.as_deref(),
+                            write.score,
+                        ));
+                        cells
+                    }
+                    // Scanned by an earlier run but not this one: the old value
+                    // is dropped and nothing is written back.
+                    None => String::new(),
+                };
+                (drop, cells)
             } else {
-                String::new()
+                (Vec::new(), String::new())
             };
 
-            if is_self_closing {
-                let tag = open_tag.trim_end().trim_end_matches('/').trim_end();
-                out.push_str(tag);
-                out.push('>');
+            let kept = if drop_columns.is_empty() {
+                inner.to_string()
             } else {
-                out.push_str(&new_open);
+                strip_cells(inner, &drop_columns)
+            };
+
+            if is_self_closing && extra.is_empty() {
+                // Nothing to change on this row.
+                out.push_str(open_tag);
+                cursor = row_open_end;
+                continue;
             }
-            out.push_str(inner);
+
+            let tag = if is_self_closing {
+                format!("{}>", open_tag.trim_end().trim_end_matches('/').trim_end())
+            } else {
+                set_span(open_tag.to_string(), last_column)
+            };
+            out.push_str(&tag);
+            out.push_str(&kept);
             out.push_str(&extra);
             out.push_str("</row>");
-            cursor = row_end + "</row>".len();
+            cursor = if is_self_closing {
+                row_open_end
+            } else {
+                row_end + "</row>".len()
+            };
         }
         out.push_str(&xml[cursor..]);
 
@@ -745,6 +778,53 @@ fn style_of(cells: &[RawCell], column: u32) -> Option<String> {
         .iter()
         .find(|cell| cell.column == column)
         .and_then(|cell| cell.style.clone())
+}
+
+/// Remove every `<c>` element of the given columns from a row fragment.
+///
+/// Used when a result column is rebuilt, so a repeated run can never leave two
+/// cells with the same reference behind. Cells of other columns are copied
+/// through verbatim.
+fn strip_cells(fragment: &str, columns: &[u32]) -> String {
+    let mut out = String::with_capacity(fragment.len());
+    let mut cursor = 0usize;
+    while let Some(offset) = fragment[cursor..].find("<c") {
+        let start = cursor + offset;
+        let after = &fragment[start + 2..];
+        if !after.starts_with(['>', ' ', '/']) {
+            out.push_str(&fragment[cursor..start + 2]);
+            cursor = start + 2;
+            continue;
+        }
+        let Some(tag_end_rel) = fragment[start..].find('>') else {
+            break;
+        };
+        let tag_end = start + tag_end_rel;
+        let open_tag = &fragment[start..=tag_end];
+        let reference = tag_attr(open_tag, "r").unwrap_or_default();
+        let column = column_of_reference(&reference);
+
+        // End offset of the whole element: right after the start tag when it is
+        // self-closing, otherwise right after the closing tag.
+        let end = if open_tag.trim_end().ends_with("/>") {
+            tag_end + 1
+        } else {
+            match fragment[tag_end..].find("</c>") {
+                Some(close_rel) => tag_end + close_rel + "</c>".len(),
+                None => break,
+            }
+        };
+
+        if column.is_some_and(|column| columns.contains(&column)) {
+            // Drop it.
+            out.push_str(&fragment[cursor..start]);
+        } else {
+            out.push_str(&fragment[cursor..end]);
+        }
+        cursor = end;
+    }
+    out.push_str(&fragment[cursor..]);
+    out
 }
 
 /// Iterate `<row>` elements as `(row number, inner start, inner end)`.

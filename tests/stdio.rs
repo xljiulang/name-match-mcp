@@ -98,6 +98,23 @@ async fn exposes_only_the_workbook_tool() -> Result<(), Box<dyn std::error::Erro
     let tools = client.list_all_tools().await?;
     assert_eq!(tools.len(), 1, "server should expose exactly one tool");
     assert_eq!(tools[0].name, "match_workbook_column");
+    assert_eq!(
+        tools[0].title.as_deref(),
+        Some("按列匹配名称并回写工作簿"),
+        "the tool should carry its Chinese display title"
+    );
+    let description = tools[0]
+        .description
+        .as_deref()
+        .expect("tool description");
+    assert!(
+        description.contains("匹配名称") && description.contains("匹配度"),
+        "description should be Chinese and mention the result columns: {description}"
+    );
+    assert!(
+        description.contains("不会重复追加"),
+        "description should state the repeated-call behaviour: {description}"
+    );
 
     let properties = tools[0]
         .input_schema
@@ -139,6 +156,16 @@ async fn exposes_only_the_workbook_tool() -> Result<(), Box<dyn std::error::Erro
     assert!(!required.contains(&"threshold"));
     assert!(tools[0].output_schema.is_some(), "output schema should be published");
 
+    // The server identifies itself with a Chinese title and description.
+    let info = client.peer_info().expect("initialize should record peer info");
+    let server = info.server_info.as_ref().expect("server implementation info");
+    assert_eq!(server.name, "name-match-mcp", "the identifier stays ASCII");
+    assert_eq!(server.title.as_deref(), Some("名称匹配"));
+    assert_eq!(
+        server.description.as_deref(),
+        Some("在工作簿内按列匹配名称并回写结果")
+    );
+
     client.cancel().await?;
     Ok(())
 }
@@ -163,7 +190,13 @@ async fn writes_two_new_columns_and_keeps_originals() -> Result<(), Box<dyn std:
     assert_eq!(summary["match_column"], "B");
     assert_eq!(summary["score_column"], "C");
     assert_eq!(summary["reused_columns"], false);
-    assert!(Path::new(summary["backup_path"].as_str().unwrap()).exists());
+    // No backup may be left behind: the only file is the workbook itself.
+    let leftovers: Vec<String> = fs::read_dir(dir.path())?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "统计.xlsx")
+        .collect();
+    assert!(leftovers.is_empty(), "unexpected leftover files: {leftovers:?}");
 
     // Original values survive, and the new cells carry the results.
     let sheet = sheet_xml(&path, "xl/worksheets/sheet2.xml");

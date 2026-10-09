@@ -1,6 +1,6 @@
 [package]
 name = "name-match-mcp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "stdio MCP server that matches target names against a reference name set"
 license = "MIT"
