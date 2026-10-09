@@ -170,8 +170,9 @@ mod tests {
 
     #[test]
     fn fuzzy_fallback_scores_near_misses() {
+        // Same numbers, a single misspelled character: still a fuzzy match.
         let reference = reference(&["压面18厘林音逸梦ENF4*8-金兔万华"]);
-        let targets = cells(&["压面18厘林音逸梦ENF4*9-金兔万华"]);
+        let targets = cells(&["压面18厘林音逸梦ENF4*8-金兔万花"]);
         let (rows, tally) = match_columns(&reference, &targets, 0.6);
 
         assert_eq!(rows[0].kind, MatchKind::Fuzzy);
@@ -186,6 +187,21 @@ mod tests {
         );
         assert_eq!(tally.fuzzy, 1);
         assert_eq!(tally.matched(), 1);
+    }
+
+    #[test]
+    fn numeric_mismatch_is_reported_as_unmatched() {
+        // A different size (`4*9` vs `4*8`) must not be reported as a match,
+        // even though the text is otherwise nearly identical.
+        let reference = reference(&["压面18厘林音逸梦ENF4*8-金兔万华"]);
+        let targets = cells(&["压面18厘林音逸梦ENF4*9-金兔万华"]);
+        let (rows, tally) = match_columns(&reference, &targets, 0.6);
+
+        assert_eq!(rows[0].kind, MatchKind::Miss);
+        assert_eq!(rows[0].matched, None, "a size mismatch is not a match");
+        assert_eq!(rows[0].score, 0.0, "a different size scores zero");
+        assert_eq!(tally.miss, 1);
+        assert_eq!(tally.matched(), 0);
     }
 
     #[test]

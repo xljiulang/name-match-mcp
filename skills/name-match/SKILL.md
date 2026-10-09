@@ -51,8 +51,8 @@ stdout 只有 JSON；成功时形如：
 
 ```json
 {"xlsx_path":"…","sheet":"9月贴面","column":"组装商品1","reference_count":2804,
- "rows_scanned":2487,"matched_count":2485,"unmatched_count":2,"exact_count":2478,
- "fuzzy_count":7,"match_column":"Q","score_column":"R","reused_columns":false,"elapsed_ms":93}
+ "rows_scanned":2487,"matched_count":2481,"unmatched_count":6,"exact_count":2478,
+ "fuzzy_count":3,"match_column":"Q","score_column":"R","reused_columns":false,"elapsed_ms":58}
 ```
 
 - `exact_count` 是归一化后完全相等的行数，`fuzzy_count` 是走相似度的行数，两者之和即 `matched_count`。
@@ -61,6 +61,20 @@ stdout 只有 JSON；成功时形如：
   必要时提高或降低 `--threshold` 重跑（重跑会覆盖同一对结果列，不会叠加）。
 - `reused_columns` 为 `true` 表示复用了已有结果列（重复调用），`false` 表示本次新追加了两列。
 - `match_column` / `score_column` 是实际写入的列字母，向用户汇报时给出这两个字母最直观。
+
+## 数字一致性（务必知道）
+
+匹配会**强制比对名称里的数字序列**（厚度、尺寸、型号编号都算）。两侧数字序列逐位相同才算同一款；
+**只要有一位不同就直接记 0 分**，无论 `--threshold` 调到多低都不会命中——降阈值救不回它们。
+
+- 好处：`压面9厘AE3503…` 不会再被误配到 `压面18厘AE3503…`。若某行看起来该匹配却没匹配，
+  先核对两侧数字（厚度/尺寸/型号）是否真的一致，再去怀疑其他原因。
+- 未匹配行的「匹配度」有两种含义，向用户解释时要分清：
+  - **`0`**：标准列里没有数字序列相同的款，即「本工作簿没有这一款」，**调低阈值也没用**。
+  - **`0~threshold` 的小数**：有数字相同的款但文本不够像，值得人工复核（或检查参考列是否选错）。
+  两种情况都**不要建议单纯调低阈值**：前者无效，后者会放进大量错候选。
+- 代价：某款在标准列里**只存在其他厚度**时（如只有 18 厘却来了 9 厘），该行会显示为未匹配。
+  这属于预期行为（宁可不匹配也不给错答案）。正确做法是核对参考列是否选错，或请人工补齐标准名。
 
 失败时 stdout 是 `{"error":{"kind":"usage|invalid|io","message":"…"}}`，退出码为 1。
 把 `message` 原样或转述给用户，不要吞掉。
