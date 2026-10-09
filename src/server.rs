@@ -1,9 +1,6 @@
-//! MCP wiring: the `match_names` tool and its `ServerHandler` implementation.
-//!
-//! The tool takes plain-text file paths and writes a CSV file, so a run never
-//! pushes the name lists through the JSON-RPC payload.
+//! MCP wiring for the single `match_workbook_column` tool.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rmcp::{
     ErrorData as McpError, Json, ServerHandler,
@@ -13,50 +10,72 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::files::{is_same_file, read_name_list, resolved_path, write_results_csv};
-use crate::{DEFAULT_THRESHOLD, match_names};
+use crate::replacement::{match_columns, to_writes};
+use crate::xlsx::{Workbook, XlsxError};
+use crate::{DEFAULT_THRESHOLD, backup_path, resolved_path};
 
-/// Arguments accepted by the `match_names` tool.
+/// Arguments accepted by the `match_workbook_column` tool.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
-pub struct MatchNamesRequest {
+pub struct MatchWorkbookRequest {
     #[schemars(
-        description = "Path to the reference name set A: a text file with one name per line (UTF-8, falling back to GBK). Every target name is compared against all of these."
+        description = "Path of the .xlsx workbook to modify in place. A timestamped backup is written next to it first."
     )]
-    pub reference_path: String,
+    pub xlsx_path: String,
     #[schemars(
-        description = "Path to the target name set B: a text file with one name per line (UTF-8, falling back to GBK). Exactly one CSV row is produced per non-blank line, in file order."
+        description = "Worksheet that holds the reference (standard) names, e.g. \"9月压面\"."
     )]
-    pub target_path: String,
+    pub reference_sheet: String,
     #[schemars(
-        description = "Path of the CSV file to write. Relative paths resolve against the server process working directory. Missing parent directories are created and an existing file is overwritten. Must differ from reference_path and target_path."
+        description = "Header text of the reference column that holds the standard names, e.g. \"商品名称\"."
     )]
-    pub output_path: String,
+    pub reference_column: String,
     #[schemars(
-        description = "Minimum score in 0.0..=1.0 for a match to be reported. Defaults to 0.6."
+        description = "Worksheet whose column should be matched, e.g. \"9月贴面\"."
+    )]
+    pub target_sheet: String,
+    #[schemars(
+        description = "Header text of the column to match, e.g. \"组装商品1\". Its original values are left untouched."
+    )]
+    pub target_column: String,
+    #[schemars(
+        description = "1-based row number of the header row. Data is read from the row below it. Defaults to 1."
+    )]
+    pub header_row: Option<u32>,
+    #[schemars(description = "Header written above the matched names. Defaults to \"匹配名称\".")]
+    pub match_column_name: Option<String>,
+    #[schemars(description = "Header written above the scores. Defaults to \"匹配度\".")]
+    pub score_column_name: Option<String>,
+    #[schemars(
+        description = "Minimum score in 0.0..=1.0 for a fuzzy match to be kept. Defaults to 0.6."
     )]
     pub threshold: Option<f64>,
 }
 
-/// Summary returned by the `match_names` tool.
-///
-/// The per-row detail lives in the generated CSV; this keeps the tool response
-/// small no matter how large the input files are.
+/// Summary returned by the tool; the per-row detail lives in the workbook.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
-pub struct MatchNamesSummary {
-    /// Absolute path of the CSV that was written.
-    pub csv_path: String,
-    /// Number of names read from `reference_path`.
+pub struct MatchWorkbookSummary {
+    /// Absolute path of the workbook that was modified.
+    pub xlsx_path: String,
+    /// Absolute path of the backup taken before the change.
+    pub backup_path: String,
+    /// Number of names read from the reference column.
     pub reference_count: usize,
-    /// Number of names read from `target_path`.
-    pub target_count: usize,
-    /// Number of rows written; always equal to `target_count`.
-    pub result_count: usize,
-    /// Rows whose score reached `threshold`.
+    /// Number of non-empty target cells that were matched.
+    pub rows_scanned: usize,
+    /// Rows matched, exact plus fuzzy.
     pub matched_count: usize,
-    /// Rows whose score fell below `threshold` (empty `匹配名称` in the CSV).
+    /// Rows left empty because nothing reached the threshold.
     pub unmatched_count: usize,
-    /// Rows whose normalized name matched a reference name exactly (score 1.0).
-    pub exact_matches: usize,
+    /// Rows whose normalized text was already in the reference column.
+    pub exact_count: usize,
+    /// Rows matched by fuzzy scoring.
+    pub fuzzy_count: usize,
+    /// Column letter the matched names were written to.
+    pub match_column: String,
+    /// Column letter the scores were written to.
+    pub score_column: String,
+    /// Whether pre-existing result columns were reused instead of appended.
+    pub reused_columns: bool,
     /// Wall-clock duration of the matching step, in milliseconds.
     pub elapsed_ms: u64,
 }
@@ -67,9 +86,9 @@ pub const SERVER_NAME: &str = "name-match-mcp";
 ///
 /// Kept as a literal because the `#[tool_handler]` attribute is parsed at
 /// compile time; `server_version_matches_package_version` guards against drift.
-pub const SERVER_VERSION: &str = "0.1.0";
+pub const SERVER_VERSION: &str = "0.2.0";
 
-/// Stateless stdio MCP server exposing the `match_names` tool.
+/// Stateless stdio MCP server exposing the workbook matching tool.
 #[derive(Debug, Clone, Default)]
 pub struct NameMatchServer;
 
@@ -78,67 +97,184 @@ impl NameMatchServer {
     pub fn new() -> Self {
         Self
     }
+
+    /// Run the tool end to end.
+    ///
+    /// Exposed separately from the MCP plumbing so tests can call it directly.
+    pub fn run_match_workbook(
+        &self,
+        request: MatchWorkbookRequest,
+    ) -> Result<MatchWorkbookSummary, McpError> {
+        let MatchWorkbookRequest {
+            xlsx_path,
+            reference_sheet,
+            reference_column,
+            target_sheet,
+            target_column,
+            header_row,
+            match_column_name,
+            score_column_name,
+            threshold,
+        } = request;
+
+        let threshold = validate_threshold(threshold)?;
+        let header_row = header_row.unwrap_or(1);
+        if header_row == 0 {
+            return Err(McpError::invalid_params(
+                "header_row is 1-based, so it must be at least 1".to_string(),
+                None,
+            ));
+        }
+        let match_header = match_column_name.unwrap_or_else(|| "匹配名称".to_string());
+        let score_header = score_column_name.unwrap_or_else(|| "匹配度".to_string());
+        if match_header.trim().is_empty() || score_header.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "match_column_name and score_column_name must not be blank".to_string(),
+                None,
+            ));
+        }
+
+        let workbook_path = PathBuf::from(&xlsx_path);
+        ensure_xlsx_extension(&workbook_path)?;
+
+        let mut workbook = Workbook::open(&workbook_path).map_err(map_xlsx_error)?;
+
+        let (reference_cells, _) =
+            read_column(&workbook, &reference_sheet, &reference_column, header_row, "reference")?;
+        if reference_cells.is_empty() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "reference column {reference_column:?} in worksheet {reference_sheet:?} has no data rows below row {header_row}"
+                ),
+                None,
+            ));
+        }
+        let reference_values: Vec<String> = reference_cells
+            .iter()
+            .map(|cell| cell.value.clone())
+            .collect();
+        let (target_cells, target_column_index) =
+            read_column(&workbook, &target_sheet, &target_column, header_row, "target")?;
+
+        let started = std::time::Instant::now();
+        let (rows, tally) = match_columns(&reference_values, &target_cells, threshold);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        // Back up before the first mutation so a failure leaves the original.
+        let backup = backup_path(&workbook_path);
+        std::fs::copy(&workbook_path, &backup).map_err(|error| {
+            McpError::internal_error(
+                format!("cannot create backup {}: {error}", backup.display()),
+                None,
+            )
+        })?;
+
+        let written = workbook
+            .write_result_columns(
+                &target_sheet,
+                header_row,
+                &match_header,
+                &score_header,
+                target_column_index,
+                &to_writes(&rows),
+            )
+            .map_err(map_xlsx_error)?;
+
+        workbook.save(&workbook_path).map_err(|error| {
+            McpError::internal_error(
+                format!(
+                    "failed to write {}: {error}. The original file is unchanged and a backup exists at {}",
+                    workbook_path.display(),
+                    backup.display()
+                ),
+                None,
+            )
+        })?;
+
+        Ok(MatchWorkbookSummary {
+            xlsx_path: resolved_path(&workbook_path).display().to_string(),
+            backup_path: resolved_path(&backup).display().to_string(),
+            reference_count: reference_values.len(),
+            rows_scanned: rows.len(),
+            matched_count: tally.matched(),
+            unmatched_count: tally.miss,
+            exact_count: tally.exact,
+            fuzzy_count: tally.fuzzy,
+            match_column: written.match_letter,
+            score_column: written.score_letter,
+            reused_columns: written.reused,
+            elapsed_ms,
+        })
+    }
 }
 
 #[tool_router]
 impl NameMatchServer {
-    /// Match each name in the `target_path` file against the `reference_path`
-    /// file and write the results to `output_path` as CSV.
+    /// Match a workbook column against a reference column and write the results
+    /// back into the same workbook as two new columns.
     #[tool(
-        description = "Match each name in the target_path text file against the reference_path text file, and write the results to output_path as a CSV with columns 待匹配名称,匹配名称,匹配度. One row per non-blank target line, in file order; 匹配名称 is empty when the score is below threshold. Returns a summary (paths and counts), not the rows."
+        description = "Match the values of one worksheet column against the values of a reference worksheet column of the same .xlsx workbook, then write the matched name and score into two new columns to the right of the target column. Original values are kept, a timestamped backup is written first, and the workbook is modified in place. Exact matches (after width/case/punctuation folding) win before fuzzy scoring. Returns a summary, not the rows."
     )]
-    fn match_names(
+    fn match_workbook_column(
         &self,
-        Parameters(MatchNamesRequest {
-            reference_path,
-            target_path,
-            output_path,
-            threshold,
-        }): Parameters<MatchNamesRequest>,
-    ) -> Result<Json<MatchNamesSummary>, McpError> {
-        let threshold = validate_threshold(threshold)?;
-
-        let reference_file = PathBuf::from(&reference_path);
-        let target_file = PathBuf::from(&target_path);
-        let output_file = PathBuf::from(&output_path);
-        ensure_output_is_distinct(&output_file, &reference_file, &target_file)?;
-
-        let reference_names = read_name_list(&reference_file).map_err(invalid_params)?;
-        let target_names = read_name_list(&target_file).map_err(invalid_params)?;
-
-        let started = std::time::Instant::now();
-        let results = match_names(&reference_names, &target_names, threshold);
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-
-        write_results_csv(&output_file, &results).map_err(|error| {
-            McpError::internal_error(format!("failed to write CSV: {error}"), None)
-        })?;
-
-        let matched_count = results
-            .iter()
-            .filter(|item| item.matched_name.is_some())
-            .count();
-        let exact_matches = results.iter().filter(|item| item.score >= 1.0).count();
-        let summary = MatchNamesSummary {
-            csv_path: resolved_path(&output_file).display().to_string(),
-            reference_count: reference_names.len(),
-            target_count: target_names.len(),
-            result_count: results.len(),
-            matched_count,
-            unmatched_count: results.len() - matched_count,
-            exact_matches,
-            elapsed_ms,
-        };
-        Ok(Json(summary))
+        Parameters(request): Parameters<MatchWorkbookRequest>,
+    ) -> Result<Json<MatchWorkbookSummary>, McpError> {
+        self.run_match_workbook(request).map(Json)
     }
 }
 
-#[tool_handler(name = "name-match-mcp", version = "0.1.0")]
+#[tool_handler(name = "name-match-mcp", version = "0.2.0")]
 impl ServerHandler for NameMatchServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Name matching service: call `match_names` with reference_path (set A), target_path (set B) and output_path to write a CSV with one 待匹配名称/匹配名称/匹配度 row per target line.",
-        )
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(rmcp::model::Implementation::new(
+                SERVER_NAME,
+                SERVER_VERSION,
+            ))
+            .with_instructions(
+                "Workbook name matching: call `match_workbook_column` with xlsx_path plus the reference and target sheet/column headers to append 匹配名称 and 匹配度 columns.",
+            )
+    }
+}
+
+/// Read one column, turning lookup failures into `invalid_params`.
+fn read_column(
+    workbook: &Workbook,
+    sheet: &str,
+    column: &str,
+    header_row: u32,
+    role: &str,
+) -> Result<(Vec<crate::xlsx::ColumnCell>, u32), McpError> {
+    workbook
+        .read_column(sheet, column, header_row)
+        .map_err(|error| map_xlsx_error_for(error, role))
+}
+
+/// Reject anything that is not a `.xlsx` file.
+fn ensure_xlsx_extension(path: &std::path::Path) -> Result<(), McpError> {
+    if !path.exists() {
+        return Err(McpError::invalid_params(
+            format!("workbook not found: {}", resolved_path(path).display()),
+            None,
+        ));
+    }
+    let extension = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "xlsx" => Ok(()),
+        other => Err(McpError::invalid_params(
+            format!(
+                "only .xlsx workbooks are supported, got {}",
+                if other.is_empty() {
+                    "(no extension)".to_string()
+                } else {
+                    format!(".{other}")
+                }
+            ),
+            None,
+        )),
     }
 }
 
@@ -154,63 +290,26 @@ fn validate_threshold(threshold: Option<f64>) -> Result<f64, McpError> {
     Ok(value)
 }
 
-/// Reject a CSV destination that would clobber one of the input files.
-fn ensure_output_is_distinct(
-    output: &Path,
-    reference: &Path,
-    target: &Path,
-) -> Result<(), McpError> {
-    for (label, input) in [("reference_path", reference), ("target_path", target)] {
-        if is_same_file(output, input) {
-            return Err(McpError::invalid_params(
-                format!(
-                    "output_path must differ from {label}: {}",
-                    resolved_path(input).display()
-                ),
-                None,
-            ));
-        }
+fn map_xlsx_error(error: XlsxError) -> McpError {
+    match error {
+        XlsxError::Invalid(message) => McpError::invalid_params(message, None),
+        XlsxError::Io(message) => McpError::internal_error(message, None),
     }
-    Ok(())
 }
 
-/// Turn an I/O failure message into an MCP `invalid_params` error.
-fn invalid_params(message: String) -> McpError {
-    McpError::invalid_params(message, None)
+fn map_xlsx_error_for(error: XlsxError, role: &str) -> McpError {
+    match error {
+        XlsxError::Invalid(message) => {
+            McpError::invalid_params(format!("{role}: {message}"), None)
+        }
+        XlsxError::Io(message) => McpError::internal_error(format!("{role}: {message}"), None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::files::{CSV_HEADERS, read_name_list};
-    use std::fs;
-
-    fn temp_dir() -> tempfile::TempDir {
-        tempfile::tempdir().expect("create temp dir")
-    }
-
-    fn write(dir: &Path, name: &str, contents: &str) -> PathBuf {
-        let path = dir.join(name);
-        fs::write(&path, contents).unwrap();
-        path
-    }
-
-    fn run(
-        reference: &Path,
-        target: &Path,
-        output: &Path,
-        threshold: Option<f64>,
-    ) -> Result<MatchNamesSummary, McpError> {
-        let request = MatchNamesRequest {
-            reference_path: reference.display().to_string(),
-            target_path: target.display().to_string(),
-            output_path: output.display().to_string(),
-            threshold,
-        };
-        NameMatchServer::new()
-            .match_names(Parameters(request))
-            .map(|Json(summary)| summary)
-    }
+    use crate::test_support::build_workbook;
 
     #[test]
     fn server_version_matches_package_version() {
@@ -228,119 +327,132 @@ mod tests {
         assert!(validate_threshold(Some(f64::INFINITY)).is_err());
     }
 
-    #[test]
-    fn writes_csv_and_reports_counts() {
-        let dir = temp_dir();
-        let reference = write(dir.path(), "参考名称.txt", "甲\n乙\n丙\n");
-        let target = write(dir.path(), "待匹配名称.txt", "甲\n乙丙\n完全无关的丁\n");
-        let output = dir.path().join("结果.csv");
+    fn request(path: &std::path::Path) -> MatchWorkbookRequest {
+        MatchWorkbookRequest {
+            xlsx_path: path.display().to_string(),
+            reference_sheet: "参考".into(),
+            reference_column: "标准名称".into(),
+            target_sheet: "目标".into(),
+            target_column: "原始名称".into(),
+            header_row: None,
+            match_column_name: None,
+            score_column_name: None,
+            threshold: None,
+        }
+    }
 
-        let summary = run(&reference, &target, &output, None).unwrap();
+    #[test]
+    fn matches_and_appends_two_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("统计.xlsx");
+        build_workbook(
+            &path,
+            &[
+                ("参考", &[&["标准名称"], &["甲"], &["乙"], &["丙"]]),
+                (
+                    "目标",
+                    &[&["原始名称"], &["甲"], &["乙"], &["完全不相关ZZZ"]],
+                ),
+            ],
+        );
+
+        let summary = NameMatchServer::new().run_match_workbook(request(&path)).unwrap();
 
         assert_eq!(summary.reference_count, 3);
-        assert_eq!(summary.target_count, 3);
-        assert_eq!(summary.result_count, 3);
-        assert_eq!(summary.matched_count + summary.unmatched_count, 3);
-        assert_eq!(summary.exact_matches, 1);
-        assert!(summary.csv_path.ends_with("结果.csv"));
-        assert!(Path::new(&summary.csv_path).is_absolute());
-
-        let csv = fs::read_to_string(&output).unwrap();
-        let lines: Vec<&str> = csv.split("\r\n").filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 4, "header plus one row per target");
-        assert_eq!(lines[0], format!("\u{FEFF}{}", CSV_HEADERS.join(",")));
-        assert!(lines[1].starts_with("甲,甲,"));
-        assert!(lines[3].starts_with("完全无关的丁,,"));
-    }
-
-    #[test]
-    fn empty_target_file_writes_header_only() {
-        let dir = temp_dir();
-        let reference = write(dir.path(), "参考名称.txt", "甲\n");
-        let target = write(dir.path(), "待匹配名称.txt", "\n  \n");
-        let output = dir.path().join("结果.csv");
-
-        let summary = run(&reference, &target, &output, None).unwrap();
-
-        assert_eq!(summary.target_count, 0);
-        assert_eq!(summary.result_count, 0);
-        assert_eq!(summary.unmatched_count, 0);
-        let csv = fs::read_to_string(&output).unwrap();
-        assert_eq!(csv, format!("\u{FEFF}{}\r\n", CSV_HEADERS.join(",")));
-    }
-
-    #[test]
-    fn high_threshold_reports_unmatched_rows() {
-        let dir = temp_dir();
-        let reference = write(dir.path(), "参考名称.txt", "Acme Corporation\n");
-        let target = write(dir.path(), "待匹配名称.txt", "Acme Corporaton\n");
-        let output = dir.path().join("结果.csv");
-
-        let summary = run(&reference, &target, &output, Some(0.99)).unwrap();
-
-        assert_eq!(summary.result_count, 1);
-        assert_eq!(summary.matched_count, 0);
+        assert_eq!(summary.rows_scanned, 3);
+        assert_eq!(summary.exact_count, 2);
         assert_eq!(summary.unmatched_count, 1);
-        assert_eq!(summary.exact_matches, 0);
-        let csv = fs::read_to_string(&output).unwrap();
-        assert!(csv.contains("Acme Corporaton,,"), "got: {csv}");
+        assert_eq!(summary.matched_count, summary.exact_count + summary.fuzzy_count);
+        assert_eq!(summary.match_column, "B");
+        assert_eq!(summary.score_column, "C");
+        assert!(!summary.reused_columns);
+        assert!(std::path::Path::new(&summary.backup_path).exists());
     }
 
     #[test]
-    fn overwrites_an_existing_output_file() {
-        let dir = temp_dir();
-        let reference = write(dir.path(), "参考名称.txt", "甲\n");
-        let target = write(dir.path(), "待匹配名称.txt", "甲\n");
-        let output = write(dir.path(), "结果.csv", "旧的、很长的内容".repeat(50).as_str());
+    fn rejects_missing_sheet_with_candidate_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("统计.xlsx");
+        build_workbook(&path, &[("参考", &[&["标准名称"], &["甲"]])]);
 
-        let summary = run(&reference, &target, &output, None).unwrap();
+        let mut req = request(&path);
+        req.reference_sheet = "不存在的表".into();
+        let error = NameMatchServer::new().run_match_workbook(req).unwrap_err();
 
-        assert_eq!(summary.result_count, 1);
-        let csv = fs::read_to_string(&output).unwrap();
-        assert!(!csv.contains("旧的"));
-        assert_eq!(csv, "\u{FEFF}待匹配名称,匹配名称,匹配度\r\n甲,甲,1\r\n");
-    }
-
-    #[test]
-    fn refuses_output_that_would_clobber_an_input() {
-        let dir = temp_dir();
-        let reference = write(dir.path(), "参考名称.txt", "甲\n");
-        let target = write(dir.path(), "待匹配名称.txt", "甲\n");
-
-        let error = run(&reference, &target, &reference, None).unwrap_err();
-        assert!(error.message.contains("output_path must differ"), "got: {}", error.message);
-        assert!(error.message.contains("reference_path"));
-
-        let error = run(&reference, &target, &target, None).unwrap_err();
-        assert!(error.message.contains("target_path"), "got: {}", error.message);
-
-        // The input file must still be intact.
-        assert_eq!(read_name_list(&reference).unwrap(), vec!["甲"]);
-    }
-
-    #[test]
-    fn missing_input_file_is_reported_as_invalid_params() {
-        let dir = temp_dir();
-        let reference = dir.path().join("不存在.txt");
-        let target = write(dir.path(), "待匹配名称.txt", "甲\n");
-        let output = dir.path().join("结果.csv");
-
-        let error = run(&reference, &target, &output, None).unwrap_err();
         assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("不存在.txt"), "got: {}", error.message);
-        assert!(!output.exists(), "no CSV should be written on failure");
+        assert!(error.message.contains("不存在的表"), "{}", error.message);
+        assert!(error.message.contains("参考"), "{}", error.message);
     }
 
     #[test]
-    fn creates_missing_output_directories() {
-        let dir = temp_dir();
-        let reference = write(dir.path(), "参考名称.txt", "甲\n");
-        let target = write(dir.path(), "待匹配名称.txt", "甲\n");
-        let output = dir.path().join("深").join("层").join("结果.csv");
+    fn rejects_missing_column_with_candidate_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("统计.xlsx");
+        build_workbook(&path, &[("参考", &[&["标准名称", "序号"], &["甲", "1"]])]);
 
-        let summary = run(&reference, &target, &output, None).unwrap();
+        let mut req = request(&path);
+        req.reference_column = "没有这一列".into();
+        let error = NameMatchServer::new().run_match_workbook(req).unwrap_err();
 
-        assert_eq!(summary.result_count, 1);
-        assert!(output.exists());
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("没有这一列"), "{}", error.message);
+        assert!(error.message.contains("标准名称"), "{}", error.message);
+        assert!(error.message.contains("序号"), "{}", error.message);
+    }
+
+    #[test]
+    fn rejects_non_xlsx_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let xls = dir.path().join("旧格式.xls");
+        std::fs::write(&xls, b"not a workbook").unwrap();
+
+        let error = NameMatchServer::new().run_match_workbook(request(&xls)).unwrap_err();
+        assert!(error.message.contains("only .xlsx"), "{}", error.message);
+
+        let missing = dir.path().join("没有这个.xlsx");
+        let error = NameMatchServer::new().run_match_workbook(request(&missing)).unwrap_err();
+        assert!(error.message.contains("not found"), "{}", error.message);
+    }
+
+    #[test]
+    fn rejects_header_row_without_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("统计.xlsx");
+        build_workbook(
+            &path,
+            &[("参考", &[&["标准名称"]]), ("目标", &[&["原始名称"]])],
+        );
+
+        let error = NameMatchServer::new().run_match_workbook(request(&path)).unwrap_err();
+        assert!(error.message.contains("no data rows"), "{}", error.message);
+    }
+
+    #[test]
+    fn rejects_out_of_range_header_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("统计.xlsx");
+        build_workbook(&path, &[("参考", &[&["标准名称"], &["甲"]])]);
+
+        let mut req = request(&path);
+        req.header_row = Some(0);
+        let error = NameMatchServer::new().run_match_workbook(req).unwrap_err();
+        assert!(error.message.contains("1-based"), "{}", error.message);
+    }
+
+    #[test]
+    fn writes_a_backup_holding_the_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("统计.xlsx");
+        build_workbook(
+            &path,
+            &[("参考", &[&["标准名称"], &["甲"]]), ("目标", &[&["原始名称"], &["甲"]])],
+        );
+        let before = std::fs::read(&path).unwrap();
+
+        let summary = NameMatchServer::new().run_match_workbook(request(&path)).unwrap();
+
+        let backup = std::fs::read(&summary.backup_path).unwrap();
+        assert_eq!(backup, before, "backup must be the pre-change workbook");
+        assert_ne!(std::fs::read(&path).unwrap(), before, "workbook must have changed");
     }
 }

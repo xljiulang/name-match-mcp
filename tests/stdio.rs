@@ -1,5 +1,5 @@
 //! End-to-end tests driving the real binary over stdio: spawn the server, run
-//! initialize -> tools/list -> tools/call, and inspect the CSV it writes.
+//! initialize -> tools/list -> tools/call, and inspect the workbook it writes.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,286 +15,257 @@ use rmcp::{
 async fn connect()
 -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, Box<dyn std::error::Error>> {
     let transport = TokioChildProcess::new(
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_name-match-mcp"))
-            .configure(|cmd| {
-                cmd.stderr(Stdio::null());
-                cmd.stdin(Stdio::piped());
-                cmd.stdout(Stdio::piped());
-            }),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_name-match-mcp")).configure(|cmd| {
+            cmd.stderr(Stdio::null());
+            cmd.stdin(Stdio::piped());
+            cmd.stdout(Stdio::piped());
+        }),
     )?;
     let client = ().serve(transport).await?;
     Ok(client)
 }
 
-/// Create an isolated working directory with the two input files.
-fn fixture(reference: &str, target: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    fs::write(dir.path().join("参考名称.txt"), reference).unwrap();
-    fs::write(dir.path().join("待匹配名称.txt"), target).unwrap();
-    dir
+/// Build a workbook with a reference sheet and a target sheet.
+fn fixture(dir: &Path, reference: &[&str], target: &[&str]) -> PathBuf {
+    let path = dir.join("统计.xlsx");
+    let reference_rows: Vec<Vec<&str>> = std::iter::once(vec!["标准名称"])
+        .chain(reference.iter().map(|value| vec![*value]))
+        .collect();
+    let target_rows: Vec<Vec<&str>> = std::iter::once(vec!["原始名称"])
+        .chain(target.iter().map(|value| vec![*value]))
+        .collect();
+    let reference_slice: Vec<&[&str]> = reference_rows.iter().map(|row| row.as_slice()).collect();
+    let target_slice: Vec<&[&str]> = target_rows.iter().map(|row| row.as_slice()).collect();
+
+    name_match_mcp::test_support::build_workbook(
+        &path,
+        &[("参考", &reference_slice), ("目标", &target_slice)],
+    );
+    path
 }
 
-fn call_arguments(
-    dir: &Path,
-    output: &str,
-    threshold: Option<f64>,
-) -> serde_json::Map<String, serde_json::Value> {
+fn arguments(path: &Path, threshold: Option<f64>) -> serde_json::Map<String, serde_json::Value> {
     let mut arguments = serde_json::Map::new();
     arguments.insert(
-        "reference_path".into(),
-        serde_json::json!(dir.join("参考名称.txt").display().to_string()),
+        "xlsx_path".into(),
+        serde_json::json!(path.display().to_string()),
     );
-    arguments.insert(
-        "target_path".into(),
-        serde_json::json!(dir.join("待匹配名称.txt").display().to_string()),
-    );
-    arguments.insert(
-        "output_path".into(),
-        serde_json::json!(dir.join(output).display().to_string()),
-    );
+    arguments.insert("reference_sheet".into(), serde_json::json!("参考"));
+    arguments.insert("reference_column".into(), serde_json::json!("标准名称"));
+    arguments.insert("target_sheet".into(), serde_json::json!("目标"));
+    arguments.insert("target_column".into(), serde_json::json!("原始名称"));
     if let Some(threshold) = threshold {
         arguments.insert("threshold".into(), serde_json::json!(threshold));
     }
     arguments
 }
 
-async fn call_match_names(
+async fn call_match(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: serde_json::Map<String, serde_json::Value>,
 ) -> Result<CallToolResult, rmcp::ServiceError> {
     client
-        .call_tool(CallToolRequestParams::new("match_names").with_arguments(arguments))
+        .call_tool(CallToolRequestParams::new("match_workbook_column").with_arguments(arguments))
         .await
 }
 
-/// Pull the summary out of a successful tool result.
 fn summary(result: &CallToolResult) -> serde_json::Value {
-    assert_ne!(result.is_error, Some(true), "tool returned an error: {:?}", result.content);
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "tool returned an error: {:?}",
+        result.content
+    );
     result
         .structured_content
         .clone()
         .expect("tool result should carry a structured summary")
 }
 
-/// Read a CSV as non-empty physical lines.
-fn csv_lines(path: &Path) -> Vec<String> {
-    fs::read_to_string(path)
-        .unwrap()
-        .split("\r\n")
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect()
+/// Read a sheet's XML so tests can assert on the written cells.
+fn sheet_xml(path: &Path, entry: &str) -> String {
+    let file = fs::File::open(path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut archive.by_name(entry).unwrap(), &mut content).unwrap();
+    content
 }
 
 #[tokio::test]
-async fn lists_match_names_tool_with_expected_schema() -> Result<(), Box<dyn std::error::Error>> {
+async fn exposes_only_the_workbook_tool() -> Result<(), Box<dyn std::error::Error>> {
     let client = connect().await?;
 
     let tools = client.list_all_tools().await?;
     assert_eq!(tools.len(), 1, "server should expose exactly one tool");
+    assert_eq!(tools[0].name, "match_workbook_column");
 
-    let tool = &tools[0];
-    assert_eq!(tool.name, "match_names");
-
-    let properties = tool
+    let properties = tools[0]
         .input_schema
         .get("properties")
         .and_then(|value| value.as_object())
         .expect("input schema should declare properties");
-    assert!(properties.contains_key("reference_path"));
-    assert!(properties.contains_key("target_path"));
-    assert!(properties.contains_key("output_path"));
-    assert!(properties.contains_key("threshold"));
-    // The old inline-array parameters must be gone.
-    assert!(!properties.contains_key("reference_names"));
-    assert!(!properties.contains_key("target_names"));
+    for expected in [
+        "xlsx_path",
+        "reference_sheet",
+        "reference_column",
+        "target_sheet",
+        "target_column",
+        "header_row",
+        "match_column_name",
+        "score_column_name",
+        "threshold",
+    ] {
+        assert!(properties.contains_key(expected), "missing {expected}");
+    }
+    // The old text/CSV interface must be gone.
+    assert!(!properties.contains_key("reference_path"));
+    assert!(!properties.contains_key("output_path"));
 
-    let required = tool
+    let required = tools[0]
         .input_schema
         .get("required")
         .and_then(|value| value.as_array())
-        .expect("input schema should declare required fields");
+        .expect("required list");
     let required: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-    assert!(required.contains(&"reference_path"));
-    assert!(required.contains(&"target_path"));
-    assert!(required.contains(&"output_path"));
+    for expected in [
+        "xlsx_path",
+        "reference_sheet",
+        "reference_column",
+        "target_sheet",
+        "target_column",
+    ] {
+        assert!(required.contains(&expected), "{expected} should be required");
+    }
     assert!(!required.contains(&"threshold"));
-
-    assert!(tool.output_schema.is_some(), "tool should publish an output schema");
-
-    client.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn writes_csv_for_chinese_com_names() -> Result<(), Box<dyn std::error::Error>> {
-    let client = connect().await?;
-    let dir = fixture(
-        "北京京东世纪贸易有限公司\n阿里巴巴（中国）有限公司\n",
-        "京东世纪贸易\n阿里巴巴(中国)有限公司\n",
-    );
-
-    let result = call_match_names(&client, call_arguments(dir.path(), "结果.csv", None)).await?;
-    let summary = summary(&result);
-
-    assert_eq!(summary["reference_count"], 2);
-    assert_eq!(summary["target_count"], 2);
-    assert_eq!(summary["result_count"], 2);
-    assert_eq!(summary["exact_matches"], 1, "base-name exact hit is folded by normalization");
-    assert!(summary["elapsed_ms"].as_u64().is_some());
-
-    let csv_path = PathBuf::from(summary["csv_path"].as_str().expect("csv_path is a string"));
-    assert!(csv_path.is_absolute());
-    let lines = csv_lines(&csv_path);
-    assert_eq!(lines.len(), 3, "header plus two rows");
-    assert_eq!(lines[0], "\u{FEFF}待匹配名称,匹配名称,匹配度");
-    assert!(lines[1].starts_with("京东世纪贸易,北京京东世纪贸易有限公司,"));
-    // Bracket/width folding makes this an exact hit.
-    assert_eq!(lines[2], "阿里巴巴(中国)有限公司,阿里巴巴（中国）有限公司,1");
+    assert!(tools[0].output_schema.is_some(), "output schema should be published");
 
     client.cancel().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn below_threshold_writes_empty_matched_column() -> Result<(), Box<dyn std::error::Error>> {
+async fn writes_two_new_columns_and_keeps_originals() -> Result<(), Box<dyn std::error::Error>> {
     let client = connect().await?;
-    let dir = fixture(
-        "Acme Corporation\n",
-        "完全不相关的名字\nAcme Corporaton\n",
-    );
+    let dir = tempfile::tempdir()?;
+    let path = fixture(dir.path(), &["甲", "乙", "丙"], &["甲", "乙", "毫不相干ZZZ"]);
 
-    let result =
-        call_match_names(&client, call_arguments(dir.path(), "结果.csv", Some(0.95))).await?;
+    let result = call_match(&client, arguments(&path, None)).await?;
     let summary = summary(&result);
 
-    assert_eq!(summary["result_count"], 2);
+    assert_eq!(summary["reference_count"], 3);
+    assert_eq!(summary["rows_scanned"], 3);
+    assert_eq!(summary["exact_count"], 2);
+    assert_eq!(summary["unmatched_count"], 1);
+    assert_eq!(
+        summary["matched_count"].as_u64().unwrap(),
+        summary["exact_count"].as_u64().unwrap() + summary["fuzzy_count"].as_u64().unwrap()
+    );
+    assert_eq!(summary["match_column"], "B");
+    assert_eq!(summary["score_column"], "C");
+    assert_eq!(summary["reused_columns"], false);
+    assert!(Path::new(summary["backup_path"].as_str().unwrap()).exists());
+
+    // Original values survive, and the new cells carry the results.
+    let sheet = sheet_xml(&path, "xl/worksheets/sheet2.xml");
+    assert!(sheet.contains(r#"<c r="A1""#), "original header kept");
+    assert!(sheet.contains(r#"<c r="B1""#), "match header added");
+    assert!(sheet.contains(r#"<c r="C1""#), "score header added");
+    assert_eq!(sheet.matches(r#"r="A2""#).count(), 1, "original column untouched");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_hits_win_and_fuzzy_covers_near_misses() -> Result<(), Box<dyn std::error::Error>> {
+    let client = connect().await?;
+    let dir = tempfile::tempdir()?;
+    let path = fixture(
+        dir.path(),
+        &["贴面18厘9层7627ENF-襄阳天湘", "压面18厘林音逸梦ENF4*8-金兔万华"],
+        &["贴面18厘9层7627ENF-襄阳天湘", "压面18厘林音逸梦ENF4*9-金兔万华"],
+    );
+
+    let result = call_match(&client, arguments(&path, Some(0.6))).await?;
+    let summary = summary(&result);
+
+    assert_eq!(summary["rows_scanned"], 2);
+    assert_eq!(summary["exact_count"], 1, "the identical value is an exact hit");
+    assert_eq!(summary["fuzzy_count"], 1, "the 8-vs-9 variant is a fuzzy hit");
+    assert_eq!(summary["unmatched_count"], 0);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_high_threshold_leaves_the_match_cell_empty() -> Result<(), Box<dyn std::error::Error>> {
+    let client = connect().await?;
+    let dir = tempfile::tempdir()?;
+    let path = fixture(dir.path(), &["Acme Corporation"], &["Acme Corporaton"]);
+
+    let result = call_match(&client, arguments(&path, Some(0.99))).await?;
+    let summary = summary(&result);
+
+    assert_eq!(summary["rows_scanned"], 1);
     assert_eq!(summary["matched_count"], 0);
-    assert_eq!(summary["unmatched_count"], 2);
-
-    let csv_path = PathBuf::from(summary["csv_path"].as_str().unwrap());
-    let lines = csv_lines(&csv_path);
-    assert_eq!(lines.len(), 3);
-    assert_eq!(lines[1].split(',').next(), Some("完全不相关的名字"));
-    // Empty 匹配名称 field: the row is "name,,score".
-    assert_eq!(lines[1].matches(',').count(), 2, "got: {}", lines[1]);
-    assert!(lines[1].starts_with("完全不相关的名字,,"));
-
-    client.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn encodes_special_characters_without_breaking_rows() -> Result<(), Box<dyn std::error::Error>>
-{
-    let client = connect().await?;
-    let dir = fixture(
-        "含,逗号公司\n含\"引号公司\n",
-        "含,逗号公司\n含\"引号公司\n",
-    );
-
-    let result = call_match_names(&client, call_arguments(dir.path(), "结果.csv", None)).await?;
-    let summary = summary(&result);
-    assert_eq!(summary["result_count"], 2);
-    assert_eq!(summary["exact_matches"], 2);
-
-    let csv_path = PathBuf::from(summary["csv_path"].as_str().unwrap());
-    let csv = fs::read_to_string(&csv_path).unwrap();
-    assert!(csv.contains("\"含,逗号公司\",\"含,逗号公司\",1"), "got: {csv}");
-    assert!(csv.contains("\"含\"\"引号公司\",\"含\"\"引号公司\",1"), "got: {csv}");
-
-    client.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn reports_counts_for_larger_mixed_input() -> Result<(), Box<dyn std::error::Error>> {
-    let client = connect().await?;
-    let reference: Vec<String> = (0..200).map(|i| format!("型号 {i} 板材")).collect();
-    let target: Vec<String> = (0..150)
-        .map(|i| format!("型号 {} 板材", i % 200))
-        .chain(std::iter::once("完全不存在的东西".to_string()))
-        .collect();
-    let dir = fixture(
-        &(reference.join("\n") + "\n"),
-        &(target.join("\n") + "\n"),
-    );
-
-    let result = call_match_names(&client, call_arguments(dir.path(), "结果.csv", None)).await?;
-    let summary = summary(&result);
-
-    assert_eq!(summary["reference_count"], 200);
-    assert_eq!(summary["target_count"], 151);
-    assert_eq!(summary["result_count"], 151, "C must have one row per target");
-    assert_eq!(summary["exact_matches"], 150);
-    assert_eq!(summary["matched_count"], 150);
     assert_eq!(summary["unmatched_count"], 1);
 
-    let csv_path = PathBuf::from(summary["csv_path"].as_str().unwrap());
-    let lines = csv_lines(&csv_path);
-    assert_eq!(lines.len(), 152, "header plus one row per target");
-    assert_eq!(lines[0], "\u{FEFF}待匹配名称,匹配名称,匹配度");
-    assert_eq!(lines[1].split(',').next(), Some("型号 0 板材"));
-    assert!(lines[151].starts_with("完全不存在的东西,,"));
-
-    client.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn missing_input_file_returns_an_error_result() -> Result<(), Box<dyn std::error::Error>> {
-    let client = connect().await?;
-    let dir = fixture("甲\n", "甲\n");
-    let mut arguments = call_arguments(dir.path(), "结果.csv", None);
-    arguments.insert(
-        "reference_path".into(),
-        serde_json::json!(dir.path().join("不存在.txt").display().to_string()),
+    let sheet = sheet_xml(&path, "xl/worksheets/sheet2.xml");
+    assert!(
+        sheet.contains(r#"<c r="B2" s="1"/>"#),
+        "unmatched cell should be empty but keep the style: {sheet}"
     );
+    client.cancel().await?;
+    Ok(())
+}
 
-    // A missing input is a caller mistake, so the server answers with a
-    // JSON-RPC invalid-params error rather than a tool result.
-    let error = call_match_names(&client, arguments)
-        .await
-        .expect_err("missing reference file must be rejected");
-    match error {
-        rmcp::ServiceError::McpError(error) => {
-            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-            assert!(error.message.contains("不存在.txt"), "got: {}", error.message);
-        }
-        other => panic!("expected an MCP error, got: {other:?}"),
-    }
-    assert!(!dir.path().join("结果.csv").exists(), "no CSV on failure");
+#[tokio::test]
+async fn rerunning_reuses_the_result_columns() -> Result<(), Box<dyn std::error::Error>> {
+    let client = connect().await?;
+    let dir = tempfile::tempdir()?;
+    let path = fixture(dir.path(), &["甲", "乙"], &["甲", "乙"]);
+
+    let first = summary(&call_match(&client, arguments(&path, None)).await?);
+    assert_eq!(first["reused_columns"], false);
+
+    let second = summary(&call_match(&client, arguments(&path, None)).await?);
+    assert_eq!(second["reused_columns"], true, "second run should reuse");
+    assert_eq!(second["match_column"], "B");
+    assert_eq!(second["score_column"], "C");
+
+    let sheet = sheet_xml(&path, "xl/worksheets/sheet2.xml");
+    assert_eq!(
+        sheet.matches(r#"r="B1""#).count(),
+        1,
+        "no duplicate match header"
+    );
+    assert_eq!(sheet.matches(r#"r="C1""#).count(), 1, "no duplicate score header");
 
     client.cancel().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn refuses_output_path_equal_to_an_input() -> Result<(), Box<dyn std::error::Error>> {
+async fn missing_sheet_returns_an_error() -> Result<(), Box<dyn std::error::Error>> {
     let client = connect().await?;
-    let dir = fixture("甲\n", "甲\n");
-    let reference_path = dir.path().join("参考名称.txt").display().to_string();
+    let dir = tempfile::tempdir()?;
+    let path = fixture(dir.path(), &["甲"], &["甲"]);
 
-    let mut arguments = call_arguments(dir.path(), "结果.csv", None);
-    arguments.insert("output_path".into(), serde_json::json!(reference_path));
-
-    let error = call_match_names(&client, arguments)
+    let mut args = arguments(&path, None);
+    args.insert("reference_sheet".into(), serde_json::json!("不存在的表"));
+    let error = call_match(&client, args)
         .await
-        .expect_err("output_path equal to an input must be rejected");
+        .expect_err("unknown sheet must be rejected");
+
     match error {
         rmcp::ServiceError::McpError(error) => {
             assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-            assert!(
-                error.message.contains("output_path must differ"),
-                "got: {}",
-                error.message
-            );
+            assert!(error.message.contains("不存在的表"), "{}", error.message);
+            assert!(error.message.contains("参考"), "{}", error.message);
         }
         other => panic!("expected an MCP error, got: {other:?}"),
     }
-    // The input file must be untouched.
-    assert_eq!(fs::read_to_string(dir.path().join("参考名称.txt")).unwrap(), "甲\n");
-
     client.cancel().await?;
     Ok(())
 }
@@ -302,17 +273,15 @@ async fn refuses_output_path_equal_to_an_input() -> Result<(), Box<dyn std::erro
 #[tokio::test]
 async fn out_of_range_threshold_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let client = connect().await?;
-    let dir = fixture("甲\n", "甲\n");
+    let dir = tempfile::tempdir()?;
+    let path = fixture(dir.path(), &["甲"], &["甲"]);
+    let before = fs::read(&path)?;
 
-    let error = call_match_names(&client, call_arguments(dir.path(), "结果.csv", Some(1.5)))
+    let error = call_match(&client, arguments(&path, Some(1.5)))
         .await
         .expect_err("threshold above 1.0 must be rejected");
-    let message = error.to_string();
-    assert!(
-        message.contains("threshold"),
-        "error should mention threshold, got: {message}"
-    );
-    assert!(!dir.path().join("结果.csv").exists());
+    assert!(error.to_string().contains("threshold"), "{error}");
+    assert_eq!(fs::read(&path)?, before, "workbook must be untouched on rejection");
 
     client.cancel().await?;
     Ok(())

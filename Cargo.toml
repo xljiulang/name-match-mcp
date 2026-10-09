@@ -1,6 +1,6 @@
 [package]
 name = "name-match-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "stdio MCP server that matches target names against a reference name set"
 license = "MIT"
@@ -25,12 +25,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
 rayon = "1"
-encoding_rs = "0.8"
+zip = { version = "6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 rmcp = { version = "3.5", features = ["client", "transport-child-process"] }
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
 tempfile = "3"
+zip = { version = "6", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = "thin"

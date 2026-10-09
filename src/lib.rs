@@ -1,16 +1,20 @@
 //! Core name-matching logic for the `name-match-mcp` server.
 //!
 //! The module is intentionally free of any MCP concerns so it can be unit tested
-//! as plain functions: normalization, similarity metrics, candidate recall and
-//! the top-level [`match_names`] entry point.
+//! as plain functions: normalization, similarity metrics, candidate recall, and
+//! helpers for the workbook surgery in [`xlsx`].
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+pub mod replacement;
 pub mod server;
-pub mod files;
+pub mod test_support;
+pub mod xlsx;
 
 /// Default match threshold applied when the caller does not supply one.
 pub const DEFAULT_THRESHOLD: f64 = 0.6;
@@ -24,8 +28,7 @@ pub const BIGRAM_WEIGHT: f64 = 0.3;
 /// One entry of the output set `C`.
 ///
 /// Exactly one entry is produced per input target name, in the same order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[derive(schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MatchItem {
     /// The original target name, echoed back unchanged.
     pub name: String,
@@ -194,6 +197,72 @@ pub fn score_normalized(a: &str, b: &str) -> f64 {
 /// Round to four decimal places so output scores stay readable and stable.
 pub fn round_score(value: f64) -> f64 {
     (value * 10_000.0).round() / 10_000.0
+}
+
+/// Resolve a possibly relative path against the process working directory.
+pub fn resolved_path(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Build the backup path for a workbook: `<name>.bak-<timestamp>.xlsx`.
+///
+/// The timestamp comes from the system clock so repeated runs never collide;
+/// a numeric suffix is appended in the unlikely event that they do.
+pub fn backup_path(workbook: &Path) -> PathBuf {
+    let stem = workbook
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workbook".to_string());
+    let directory = workbook.parent().unwrap_or_else(|| Path::new("."));
+
+    let stamp = timestamp();
+    let mut candidate = directory.join(format!("{stem}.bak-{stamp}.xlsx"));
+    let mut suffix = 1u32;
+    while candidate.exists() {
+        candidate = directory.join(format!("{stem}.bak-{stamp}-{suffix}.xlsx"));
+        suffix += 1;
+    }
+    candidate
+}
+
+/// `yyyyMMdd-HHmmss` in UTC.
+///
+/// Computed without a date library: the days-to-civil conversion is the
+/// standard algorithm, and UTC keeps the backup name stable regardless of the
+/// machine's timezone database.
+fn timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+
+    let days = (seconds / 86_400) as i64;
+    let time_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = time_of_day / 3_600;
+    let minute = (time_of_day % 3_600) / 60;
+    let second = time_of_day % 60;
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
+/// Days since 1970-01-01 to a civil (year, month, day) date.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
 }
 
 /// Pre-built search index over the normalized reference names.
