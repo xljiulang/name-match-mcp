@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub mod cli;
+pub mod lockfile;
 pub mod replacement;
 pub mod test_support;
 pub mod xlsx;

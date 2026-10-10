@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use crate::replacement::{match_columns, to_writes};
 use crate::xlsx::{Workbook, XlsxError};
+use crate::lockfile::WorkbookLock;
 use crate::{DEFAULT_THRESHOLD, resolved_path};
 
 /// Usage text shown by `--help`.
@@ -97,6 +98,11 @@ pub struct MatchSummary {
     pub reused_columns: bool,
     /// Wall-clock duration of the matching step, in milliseconds.
     pub elapsed_ms: u64,
+    /// How long this run waited for another process to release the workbook.
+    ///
+    /// Non-zero means a concurrent run was in progress and this call was
+    /// serialized behind it.
+    pub waited_ms: u64,
 }
 
 /// A failure with enough detail for the caller to classify it.
@@ -316,6 +322,11 @@ pub fn run(args: &MatchArgs) -> Result<MatchSummary, CliError> {
     let workbook_path = PathBuf::from(&args.workbook);
     ensure_xlsx_extension(&workbook_path)?;
 
+    // Hold this across the whole read-modify-write span. Two runs that both read
+    // the file before either writes would make the later write discard the
+    // earlier result, so the lock must cover reading too, not just saving.
+    let lock = WorkbookLock::acquire(&workbook_path)?;
+
     let mut workbook = Workbook::open(&workbook_path).map_err(map_xlsx_error)?;
 
     let (reference_cells, _) = read_column(
@@ -363,6 +374,9 @@ pub fn run(args: &MatchArgs) -> Result<MatchSummary, CliError> {
         ))
     })?;
 
+    let waited_ms = lock.waited().as_millis() as u64;
+    drop(lock);
+
     Ok(MatchSummary {
         xlsx_path: resolved_path(&workbook_path).display().to_string(),
         sheet: args.target_sheet.clone(),
@@ -377,6 +391,7 @@ pub fn run(args: &MatchArgs) -> Result<MatchSummary, CliError> {
         score_column: written.score_letter,
         reused_columns: written.reused,
         elapsed_ms,
+        waited_ms,
     })
 }
 
@@ -804,13 +819,17 @@ mod tests {
         run(&base_args(&path)).unwrap();
 
         assert_ne!(std::fs::read(&path).unwrap(), before, "workbook must change");
+        // The sidecar lock file is expected to remain; nothing else may.
         let leftovers: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name != "统计.xlsx")
+            .filter(|name| name != "统计.xlsx" && name != ".统计.xlsx.lock")
             .collect();
-        assert!(leftovers.is_empty(), "no backup or temp file may remain: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "no backup or temp file may remain (only the sidecar lock is allowed): {leftovers:?}"
+        );
     }
 
     #[test]

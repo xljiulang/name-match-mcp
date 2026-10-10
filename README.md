@@ -44,14 +44,15 @@ name-match match \
 
 ```json
 {"xlsx_path":"C:\\work\\统计.xlsx","sheet":"9月贴面","column":"组装商品1",
- "reference_count":2804,"rows_scanned":2487,"matched_count":2485,"unmatched_count":2,
- "exact_count":2478,"fuzzy_count":7,"match_column":"Q","score_column":"R",
- "reused_columns":false,"elapsed_ms":93}
+ "reference_count":2804,"rows_scanned":2487,"matched_count":2481,"unmatched_count":6,
+ "exact_count":2478,"fuzzy_count":3,"match_column":"Q","score_column":"R",
+ "reused_columns":false,"elapsed_ms":150,"waited_ms":0}
 ```
 
 - `exact_count + fuzzy_count + unmatched_count` 恒等于 `rows_scanned`（目标列非空数据行数）。
 - `match_column` / `score_column` 是实际写入的列字母。
 - `reused_columns` 为 `true` 表示复用了已有结果列，`false` 表示本次新追加。
+- `waited_ms` 是本次等待其他进程释放该工作簿锁的时长；`0` 表示无需等待。
 
 失败时输出 `{"error":{"kind":"usage|invalid|io","message":"…"}}`。
 
@@ -153,6 +154,7 @@ Copy-Item -Recurse skills\name-match "$env:USERPROFILE\.codex\skills\"
 - `src/xlsx.rs`：xlsx 外科手术——按 zip 条目读写、sheet XML 定位与改列、结果列整列重建。
 - `src/replacement.rs`：纯逻辑编排——精确查表、模糊兜底、写回值生成。
 - `src/cli.rs`：参数解析、任务编排、JSON 输出与错误分类。
+- `src/lockfile.rs`：同一工作簿的跨进程文件锁（基于标准库的文件锁，无额外依赖）。
 - `src/main.rs`：进程入口（退出码与 stdout/stderr 约定）。
 - `src/test_support.rs`：测试用最小 xlsx 构造器。
 - `tests/cli.rs`：进程级 CLI 集成测试。
@@ -161,9 +163,16 @@ Copy-Item -Recurse skills\name-match "$env:USERPROFILE\.codex\skills\"
 
 ## 已知边界
 
-- **没有备份、没有锁**：直接原地修改工作簿。写入走「同目录临时文件 + 原子替换」，单次写入要么
-  完整生效、要么原文件不变；但**并发对同一文件调用不保证结果正确**，且出错时没有备份可回退，
-  请自行保留副本、避免并发（多列匹配应串行调用）。
+- **并发对同一工作簿是安全的**：每次调用会先在旁路文件 `.<文件名>.lock` 上取一把跨进程锁，
+  覆盖「读取 → 修改 → 写入」整个过程，直到写盘完成才释放。因此并行对同一工作簿的多个调用会
+  **自动串行化**，不会出现「两个调用都基于旧文件、后写者覆盖前者」的丢数据问题。等待期间会在
+  stderr 打印一行提示；摘要里的 `waited_ms` 表示本次等待了多久（0 表示无需等待）。
+  锁由内核持有，进程被强杀也会自动释放，不会留下死锁。**仍建议串行调用**，因为等待会拉长总耗时；
+  处理不同工作簿时完全并行，互不等待。
+- **没有备份**：直接原地修改工作簿，出错时没有备份可回退，重要文件请自行保留副本。
+  写入走「同目录临时文件 + 原子替换」，单次写入要么完整生效、要么原文件不变。
+- `.xxx.lock` 是旁路锁文件（空文件，仅作句柄），**可安全忽略**；程序刻意不删除它，避免产生
+  「一个进程删掉锁文件、另一个又建同名新文件」的竞态。不在运行时手工删除也无妨。
 - 新列写在整张表最后一列的右侧；若该位置已被占用，会占用其右侧紧邻的空列。
 - 不刷新透视表缓存，Excel 打开后按需自行刷新。
 - 工作簿被 Excel 占用时写入会失败（退出码 1，原文件保持不变），先关闭文件再重试。
